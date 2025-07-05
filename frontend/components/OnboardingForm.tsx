@@ -1,5 +1,8 @@
+"use client";
+
 import { useState } from 'react';
 import { api } from '@/lib/api';
+import { useRouter } from 'next/navigation';
 
 const tiers = [
   { value: 'TIER_10_25', label: '$10M – $25M' },
@@ -19,6 +22,7 @@ export default function OnboardingForm() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  const router = useRouter();
 
   const update = (field: string, value: string) =>
     setForm((f) => ({ ...f, [field]: value }));
@@ -34,6 +38,7 @@ export default function OnboardingForm() {
         body: JSON.stringify(form),
       });
       setSuccess(true);
+      router.push('/portfolio');
     } catch (e: any) {
       setError(e.message);
     } finally {

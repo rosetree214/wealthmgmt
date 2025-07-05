@@ -12,6 +12,7 @@ model User {
   email     String    @unique
   password  String
   tier      Tier      @default(TIER_10_25)
+  profile   Json?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 

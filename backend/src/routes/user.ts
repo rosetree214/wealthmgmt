@@ -17,9 +17,13 @@ router.post('/profile', async (req: Request, res: Response) => {
     const updated = await prisma.user.update({
       where: { id: userId },
       data: {
-        // Store additional profile fields in a JSON column or separate table as you model further
         tier,
-        // riskTolerance, liquidityNeeds, timeHorizon, values – placeholders
+        profile: {
+          riskTolerance,
+          liquidityNeeds,
+          timeHorizon,
+          values,
+        },
       }
     });
     res.json({ user: updated });
