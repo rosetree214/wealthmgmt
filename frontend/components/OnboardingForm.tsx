@@ -31,6 +31,10 @@ export default function OnboardingForm() {
   const prev = () => setStep((s) => Math.max(0, s - 1));
 
   const submit = async () => {
+    if (!form.liquidityNeeds || Number(form.liquidityNeeds) <= 0) {
+      setError('Liquidity needs must be greater than 0');
+      return;
+    }
     try {
       setLoading(true);
       await api('/api/user/profile', {
@@ -39,8 +43,12 @@ export default function OnboardingForm() {
       });
       setSuccess(true);
       router.push('/portfolio');
-    } catch (e: any) {
-      setError(e.message);
+    } catch (e: unknown) {
+      if (e instanceof Error) {
+        setError(e.message);
+      } else {
+        setError('An unknown error occurred');
+      }
     } finally {
       setLoading(false);
     }

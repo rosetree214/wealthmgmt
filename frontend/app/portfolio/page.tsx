@@ -1,11 +1,17 @@
 import { api } from '@/lib/api';
 
+interface PortfolioItem {
+  id: number | string;
+  name?: string;
+  [key: string]: unknown;
+}
+
 async function getPortfolio() {
   try {
-    return await api<{ portfolio: any[] }>('/api/portfolio');
+    return await api<{ portfolio: PortfolioItem[] }>('/api/portfolio');
   } catch (e) {
     console.error(e);
-    return { portfolio: [] };
+    return { portfolio: [] as PortfolioItem[] };
   }
 }
 
@@ -20,7 +26,7 @@ export default async function PortfolioPage() {
         <p>No holdings yet.</p>
       ) : (
         <ul className="space-y-4">
-          {portfolio.map((item: any) => (
+          {portfolio.map((item) => (
             <li key={item.id} className="p-4 bg-white dark:bg-gray-800 rounded shadow">
               {JSON.stringify(item)}
             </li>
