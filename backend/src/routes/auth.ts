@@ -1,11 +1,11 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 
 const router = Router();
 
 // POST /register
-router.post('/register', async (req, res) => {
+router.post('/register', async (req: Request, res: Response) => {
   // TODO: validate body
   const { email, password } = req.body;
   const hashed = await bcrypt.hash(password, 10);
@@ -15,7 +15,7 @@ router.post('/register', async (req, res) => {
 });
 
 // POST /login
-router.post('/login', async (req, res) => {
+router.post('/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
   // TODO: find user via Prisma
   // const user = await prisma.user.findUnique({ where: { email } });
@@ -23,7 +23,7 @@ router.post('/login', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Invalid creds' });
   const valid = await bcrypt.compare(password, user.password);
   if (!valid) return res.status(401).json({ error: 'Invalid creds' });
-  const token = jwt.sign({ sub: user.id }, process.env.JWT_SECRET as string, { expiresIn: '1d' });
+  const token = jwt.sign({ sub: (user as any).id }, process.env.JWT_SECRET as string, { expiresIn: '1d' });
   res.json({ token });
 });
 
