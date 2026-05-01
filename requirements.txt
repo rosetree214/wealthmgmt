@@ -1,0 +1,10 @@
+streamlit>=1.30
+edgartools>=2.20
+alpaca-py>=0.20
+yfinance>=0.2.40
+python-dotenv>=1.0
+pandas>=2.1
+APScheduler>=3.10,<4
+plotly>=5.18
+requests>=2.31
+pytest>=7.4
