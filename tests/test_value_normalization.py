@@ -136,6 +136,12 @@ def test_identifier_to_cik_resolves_manager_names(monkeypatch):
         email_to=None,
         slack_webhook_url=None,
         app_password=None,
+        broker="alpaca",
+        ibkr_host="127.0.0.1",
+        ibkr_port=7497,
+        ibkr_client_id=13,
+        ibkr_account=None,
+        ibkr_read_only=True,
         preview_ttl_seconds=300,
         scan_form_types=["13F-HR", "13F-HR/A"],
     )

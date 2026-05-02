@@ -1,6 +1,6 @@
 # 13F Mirror Trader
 
-13F Mirror Trader is a personal-use Streamlit app for mirroring the latest Form 13F-HR holdings of an investment manager into a target portfolio size, comparing those targets against an Alpaca portfolio, previewing trades, and optionally submitting orders through Alpaca with strict safety gates.
+13F Mirror Trader is a personal-use Streamlit app for mirroring the latest Form 13F-HR holdings of an investment manager into a target portfolio size, comparing those targets against a broker portfolio, previewing trades, and optionally submitting orders through Alpaca or Interactive Brokers with strict safety gates.
 
 Default manager:
 
@@ -24,7 +24,7 @@ This project is software tooling, not investment advice.
 - Displays clean holdings, including missing ticker and option warnings.
 - Scales disclosed holdings to a target portfolio size.
 - Looks up prices using yfinance fallback.
-- Connects to Alpaca with `alpaca-py` when keys are configured.
+- Connects to Alpaca with `alpaca-py` or Interactive Brokers through TWS/IB Gateway when configured.
 - Compares target shares with current positions.
 - Generates sell-before-buy trade previews.
 - Stores preview hashes so execution cannot use stale previews.
@@ -40,7 +40,7 @@ This project is software tooling, not investment advice.
 - It does not guarantee 13F data completeness or timeliness.
 - It does not auto-convert options positions into underlying shares.
 - It does not liquidate unrelated holdings unless full-account rebalance is explicitly enabled.
-- It does not trade without Alpaca keys and explicit execution confirmation.
+- It does not trade without broker connectivity and explicit execution confirmation.
 - It does not make automatic live trading possible by default.
 - It does not mirror non-13F forms. Comparable filings such as Schedule 13D/13G are detection/notification inputs only unless a safe parser is added later.
 
@@ -61,13 +61,26 @@ Edit `.env` and set at least:
 EDGAR_IDENTITY="Your Name your.email@example.com"
 ```
 
-Alpaca keys are optional. Without them, the app still shows 13F holdings and scaled targets, but portfolio comparison and execution are disabled.
+Broker configuration is optional. Without it, the app still shows 13F holdings and scaled targets, but portfolio comparison and execution are disabled.
 
 ```bash
+BROKER=alpaca
 ALPACA_API_KEY="..."
 ALPACA_SECRET_KEY="..."
 ALPACA_PAPER=true
 ```
+
+Interactive Brokers support uses TWS or IB Gateway plus `ib_insync`:
+
+```bash
+BROKER=ibkr
+IBKR_HOST=127.0.0.1
+IBKR_PORT=7497
+IBKR_CLIENT_ID=13
+IBKR_READ_ONLY=true
+```
+
+Keep `IBKR_READ_ONLY=true` while testing account and position access. Set it to `false` only when you are ready to allow order submission through the existing preview and confirmation gates.
 
 ## Run locally
 
@@ -97,7 +110,7 @@ python -m core.auto_rebalancer --help
 
 ### Paper trading
 
-`ALPACA_PAPER=true` is the default. The UI shows a paper/live mode indicator. Execution remains disabled until a preview exists, the preview hash matches, and the user checks the confirmation box.
+`ALPACA_PAPER=true` is the default for Alpaca. For IBKR, paper/live mode is determined by the TWS or IB Gateway port you connect to: `7497` is the common paper port and `7496` is the common live port. Execution remains disabled until a preview exists, the preview hash matches, and the user checks the confirmation box.
 
 ### Live trading
 
@@ -105,6 +118,14 @@ Live trading requires:
 
 ```bash
 ALPACA_PAPER=false
+ALLOW_LIVE_TRADING=true
+```
+
+For IBKR live trading, connect to your live TWS/Gateway session and set:
+
+```bash
+BROKER=ibkr
+IBKR_READ_ONLY=false
 ALLOW_LIVE_TRADING=true
 ```
 
@@ -203,6 +224,17 @@ EDGAR_IDENTITY="Your Name your.email@example.com"
 
 The app will still fetch holdings and calculate scaled targets. Portfolio comparison and execution remain disabled until `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` are configured.
 
+### Interactive Brokers connection
+
+IBKR requires TWS or IB Gateway to be running and API access enabled. Check:
+
+- `BROKER=ibkr`
+- `IBKR_HOST` and `IBKR_PORT`
+- `IBKR_CLIENT_ID`
+- TWS/Gateway API settings allow socket clients
+- Paper trading commonly uses port `7497`; live commonly uses `7496`
+- `IBKR_READ_ONLY=true` prevents order submission while testing
+
 ### Missing tickers
 
 Some 13F rows may not include tickers. These rows are displayed with warnings and excluded from generated orders.
@@ -217,7 +249,7 @@ If yfinance cannot return a positive recent price, the symbol is skipped for tra
 
 ### Non-fractionable assets
 
-Alpaca asset metadata is checked before preview generation. Non-fractionable buys are rounded down to whole shares. Sells are clipped to the current position.
+Broker asset metadata is checked before preview generation. Non-fractionable buys are rounded down to whole shares. Sells are clipped to the current position.
 
 ### Insufficient buying power
 

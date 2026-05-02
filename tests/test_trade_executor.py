@@ -30,6 +30,12 @@ def _config() -> AppConfig:
         app_password=None,
         preview_ttl_seconds=300,
         scan_form_types=["13F-HR", "13F-HR/A"],
+        broker="alpaca",
+        ibkr_host="127.0.0.1",
+        ibkr_port=7497,
+        ibkr_client_id=13,
+        ibkr_account=None,
+        ibkr_read_only=True,
     )
 
 

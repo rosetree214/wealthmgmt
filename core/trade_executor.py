@@ -23,6 +23,13 @@ except Exception:  # pragma: no cover - optional until dependency is installed
     TimeInForce = None
     MarketOrderRequest = None
 
+try:
+    from ib_insync import IB, MarketOrder, Stock
+except Exception:  # pragma: no cover - optional until dependency is installed
+    IB = None
+    MarketOrder = None
+    Stock = None
+
 
 @dataclass(frozen=True)
 class AlpacaStatus:
@@ -30,6 +37,9 @@ class AlpacaStatus:
     paper: bool
     account: dict[str, Any] | None
     message: str
+
+
+BrokerStatus = AlpacaStatus
 
 
 class AlpacaService:
@@ -278,6 +288,360 @@ class AlpacaService:
         return responses
 
     def _validate_preview_freshness(self, preview_created_at: str | None) -> None:
+        _validate_preview_freshness_for_service(self, preview_created_at)
+
+    def _validate_executable_preview(self, executable: pd.DataFrame) -> None:
+        _validate_executable_preview_for_service(self, executable)
+
+
+def get_broker_service(settings: AppConfig):
+    if settings.broker == "ibkr":
+        return IBKRService(settings)
+    if settings.broker == "alpaca":
+        return AlpacaService(settings)
+    raise ValueError(f"Unsupported broker '{settings.broker}'. Use 'alpaca' or 'ibkr'.")
+
+
+def _yfinance_prices(symbols: list[str], paper: bool) -> dict[str, dict[str, Any]]:
+    prices: dict[str, dict[str, Any]] = {}
+    try:
+        import yfinance as yf
+
+        for symbol in symbols:
+            ticker = yf.Ticker(symbol)
+            history = ticker.history(period="1d", interval="1m")
+            if history.empty:
+                history = ticker.history(period="5d", interval="1d")
+            if history.empty:
+                continue
+            last = history.tail(1)
+            price = float(last["Close"].iloc[0])
+            if price <= 0:
+                continue
+            timestamp = last.index[-1].isoformat()
+            prices[symbol] = {"price": price, "source": "yfinance", "timestamp": timestamp}
+    except Exception as exc:
+        log_event("price_lookup_error", paper_mode=paper, details={"error": str(exc)})
+    return prices
+
+
+def _validate_preview_freshness_for_service(service: Any, preview_created_at: str | None) -> None:
+    if not preview_created_at:
+        raise PermissionError("Preview timestamp is missing; regenerate preview before execution.")
+    try:
+        created_at = datetime.fromisoformat(str(preview_created_at).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PermissionError("Preview timestamp is invalid; regenerate preview before execution.") from exc
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    ttl_seconds = max(30, min(int(service.settings.preview_ttl_seconds), PREVIEW_TTL_SECONDS))
+    if datetime.now(UTC) - created_at > timedelta(seconds=ttl_seconds):
+        raise PermissionError("Preview is stale; regenerate preview before execution.")
+
+
+def _validate_executable_preview_for_service(service: Any, executable: pd.DataFrame) -> None:
+    if executable.empty:
+        return
+
+    symbols = executable["symbol"].dropna().astype(str).tolist()
+    account = service.get_account_status()
+    positions = service.get_positions()
+    fresh_prices = service.get_prices(symbols)
+    asset_metadata = service.get_asset_metadata(symbols)
+    total_buy_notional = 0.0
+    total_sell_notional = 0.0
+
+    for _, row in executable.iterrows():
+        symbol = str(row.get("symbol") or "").upper().strip()
+        side = str(row.get("side") or "").lower()
+        qty = abs(float(row.get("delta_shares") or 0))
+        warnings = str(row.get("warnings") or "").strip()
+        price = row.get("estimated_price")
+        notional = row.get("estimated_notional")
+        fresh_price = fresh_prices.get(symbol, {}).get("price")
+
+        if not symbol:
+            raise PermissionError("Executable preview row is missing a symbol.")
+        if warnings:
+            raise PermissionError(f"{symbol} has unresolved warnings: {warnings}")
+        if qty <= 0:
+            raise PermissionError(f"{symbol} has non-positive order quantity.")
+        if price is None or pd.isna(price) or float(price) <= 0:
+            raise PermissionError(f"{symbol} is missing a valid execution price.")
+        if notional is None or pd.isna(notional) or float(notional) <= 0:
+            raise PermissionError(f"{symbol} is missing a valid execution notional.")
+        if fresh_price is None or float(fresh_price) <= 0:
+            raise PermissionError(f"{symbol} is missing a fresh execution-time price.")
+        fresh_notional = qty * float(fresh_price)
+        preview_notional = float(notional)
+        if preview_notional > 0 and abs(fresh_notional - preview_notional) / preview_notional > 0.05:
+            raise PermissionError(f"{symbol} price moved more than 5%; regenerate preview.")
+
+        asset = asset_metadata.get(symbol)
+        if not asset or not asset.get("tradable") or str(asset.get("asset_status")).lower() != "active":
+            raise PermissionError(f"{symbol} is not active and tradable at execution time.")
+
+        if side == "sell":
+            current_qty = float(positions.get(symbol, 0.0))
+            if qty > current_qty:
+                raise PermissionError(f"{symbol} sell quantity exceeds current position.")
+            total_sell_notional += fresh_notional
+        elif side == "buy":
+            total_buy_notional += fresh_notional
+
+    buying_power = 0.0
+    if account.account:
+        buying_power = float(account.account.get("buying_power") or 0)
+    if total_buy_notional > buying_power + total_sell_notional:
+        raise PermissionError("Preview buy notional exceeds buying power plus sell proceeds.")
+
+    log_event(
+        "order_preflight_passed",
+        paper_mode=service.paper,
+        dry_run=False,
+        details={
+            "orders": len(executable),
+            "checked_at": datetime.now(UTC).isoformat(),
+            "buy_notional": total_buy_notional,
+            "sell_notional": total_sell_notional,
+        },
+    )
+
+
+class IBKRService:
+    def __init__(self, settings: AppConfig):
+        self.settings = settings
+        self.paper = settings.ibkr_paper
+        self._client = None
+        self._connected = False
+
+        if settings.ibkr_configured and IB is not None:
+            self._client = IB()
+            try:
+                self._client.connect(
+                    settings.ibkr_host,
+                    int(settings.ibkr_port),
+                    clientId=int(settings.ibkr_client_id),
+                    timeout=5,
+                    readonly=bool(settings.ibkr_read_only),
+                )
+                self._connected = bool(self._client.isConnected())
+            except Exception as exc:
+                log_event("ibkr_connect_error", paper_mode=self.paper, details={"error": str(exc)})
+                self._connected = False
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.settings.ibkr_configured and self._client is not None and self._connected)
+
+    def get_account_status(self) -> BrokerStatus:
+        if not self.settings.ibkr_configured:
+            return BrokerStatus(False, self.paper, None, "IBKR is not configured.")
+        if IB is None:
+            return BrokerStatus(False, self.paper, None, "ib_insync is not installed.")
+        if not self.configured:
+            return BrokerStatus(False, self.paper, None, "IBKR Gateway/TWS is not connected.")
+
+        try:
+            account_values = self._client.accountSummary()
+            data = {"status": "connected", "currency": "USD"}
+            for item in account_values:
+                account = getattr(item, "account", None)
+                if self.settings.ibkr_account:
+                    if account != self.settings.ibkr_account:
+                        continue
+                tag = getattr(item, "tag", "")
+                value = getattr(item, "value", None)
+                currency = getattr(item, "currency", None)
+                if tag == "BuyingPower":
+                    data["buying_power"] = float(value)
+                    data["currency"] = currency or data["currency"]
+                elif tag == "NetLiquidation":
+                    data["portfolio_value"] = float(value)
+                    data["currency"] = currency or data["currency"]
+            return BrokerStatus(True, self.paper, data, "Connected to IBKR.")
+        except Exception as exc:
+            log_event("ibkr_account_error", paper_mode=self.paper, details={"error": str(exc)})
+            return BrokerStatus(False, self.paper, None, f"IBKR account fetch failed: {exc}")
+
+    def get_positions(self) -> dict[str, float]:
+        if not self.configured:
+            return {}
+        positions: dict[str, float] = {}
+        try:
+            portfolio_items = (
+                self._client.portfolio()
+                if hasattr(self._client, "portfolio")
+                else self._client.positions()
+            )
+            for position in portfolio_items:
+                account = getattr(position, "account", None)
+                if self.settings.ibkr_account:
+                    if account != self.settings.ibkr_account:
+                        continue
+                contract = getattr(position, "contract", None)
+                symbol = getattr(contract, "symbol", None)
+                sec_type = str(getattr(contract, "secType", "STK")).upper()
+                if symbol and sec_type == "STK":
+                    positions[str(symbol).upper()] = float(getattr(position, "position", 0))
+        except Exception as exc:
+            log_event("ibkr_positions_error", paper_mode=self.paper, details={"error": str(exc)})
+        return positions
+
+    def get_asset_metadata(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        metadata: dict[str, dict[str, Any]] = {}
+        if not self.configured or Stock is None:
+            return metadata
+        for symbol in sorted({symbol.upper() for symbol in symbols if symbol}):
+            try:
+                contracts = self._client.qualifyContracts(Stock(symbol, "SMART", "USD"))
+                metadata[symbol] = {
+                    "tradable": bool(contracts),
+                    "asset_status": "active" if contracts else "unknown",
+                    "fractionable": bool(self.settings.ibkr_fractional_shares),
+                }
+            except Exception as exc:
+                log_event("ibkr_contract_error", paper_mode=self.paper, details={"symbol": symbol, "error": str(exc)})
+                metadata[symbol] = {"tradable": False, "asset_status": "unknown", "fractionable": False}
+        return metadata
+
+    def get_prices(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        prices: dict[str, dict[str, Any]] = {}
+        unique_symbols = sorted({symbol.upper() for symbol in symbols if symbol})
+        if self.configured and Stock is not None:
+            for symbol in unique_symbols:
+                try:
+                    contract = Stock(symbol, "SMART", "USD")
+                    qualified = self._client.qualifyContracts(contract)
+                    if not qualified:
+                        continue
+                    ticker = self._client.reqMktData(qualified[0], "", False, False)
+                    self._client.sleep(1)
+                    price = getattr(ticker, "marketPrice", lambda: None)()
+                    if price is None or price <= 0:
+                        price = getattr(ticker, "last", None) or getattr(ticker, "close", None)
+                    if price and float(price) > 0:
+                        prices[symbol] = {
+                            "price": float(price),
+                            "source": "ibkr",
+                            "timestamp": datetime.now(UTC).isoformat(),
+                        }
+                    self._client.cancelMktData(qualified[0])
+                except Exception as exc:
+                    log_event("ibkr_price_error", paper_mode=self.paper, details={"symbol": symbol, "error": str(exc)})
+
+        missing_symbols = [symbol for symbol in unique_symbols if symbol not in prices]
+        if missing_symbols:
+            prices.update(_yfinance_prices(missing_symbols, self.paper))
+        return prices
+
+    def build_preview(
+        self,
+        targets: pd.DataFrame,
+        min_trade_notional: float,
+        full_account_rebalance: bool = False,
+    ) -> pd.DataFrame:
+        positions = self.get_positions()
+        return generate_trade_preview(
+            targets,
+            positions,
+            min_trade_notional=min_trade_notional,
+            full_account_rebalance=full_account_rebalance,
+        )
+
+    def build_trade_preview(self, targets: pd.DataFrame, current_positions: dict[str, float]) -> pd.DataFrame:
+        return generate_trade_preview(
+            targets,
+            current_positions,
+            min_trade_notional=self.settings.min_trade_notional,
+        )
+
+    def submit_orders(self, preview: pd.DataFrame) -> list[dict[str, Any]]:
+        if not self.settings.auto_execute:
+            raise PermissionError("AUTO_EXECUTE must be true before automated order submission.")
+        if self.settings.ibkr_read_only:
+            raise PermissionError("IBKR_READONLY must be false before IBKR order submission.")
+        if not self.paper and not (
+            self.settings.allow_live_trading and self.settings.allow_live_auto_execute
+        ):
+            raise PermissionError("Automated live trading is disabled by safety gates.")
+        return self.submit_preview_orders(
+            preview,
+            "auto",
+            "auto",
+            confirm=True,
+            automated=True,
+            preview_created_at=datetime.now(UTC).isoformat(),
+            live_confirm=self.settings.allow_live_auto_execute,
+        )
+
+    def submit_preview_orders(
+        self,
+        preview: pd.DataFrame,
+        preview_hash: str,
+        current_hash: str,
+        confirm: bool,
+        automated: bool = False,
+        preview_created_at: str | None = None,
+        live_confirm: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not confirm:
+            raise PermissionError("Execution requires explicit user confirmation.")
+        if not automated and preview_hash != current_hash:
+            raise PermissionError("Preview hash changed; regenerate preview before execution.")
+        self._validate_preview_freshness(preview_created_at)
+        if self.settings.ibkr_read_only:
+            raise PermissionError("IBKR_ALLOW_TRADING must be true before IBKR order submission.")
+        if not self.configured:
+            raise PermissionError("IBKR Gateway/TWS connection is required for execution.")
+        if not self.paper and not self.settings.allow_live_trading:
+            raise PermissionError("Live trading requires ALLOW_LIVE_TRADING=true.")
+        if not self.paper and not live_confirm:
+            raise PermissionError("Live trading requires explicit live confirmation.")
+        if MarketOrder is None or Stock is None:
+            raise PermissionError("ib_insync is required for IBKR order submission.")
+
+        executable = preview[preview["side"].isin(["sell", "buy"])].copy()
+        self._validate_executable_preview(executable)
+        executable["_sort"] = executable["side"].map({"sell": 0, "buy": 1})
+        executable = executable.sort_values(["_sort", "symbol"])
+
+        responses: list[dict[str, Any]] = []
+        for _, row in executable.iterrows():
+            symbol = str(row["symbol"]).upper()
+            qty = abs(float(row["delta_shares"]))
+            side = str(row["side"]).upper()
+            if qty <= 0:
+                continue
+            try:
+                if not self.settings.ibkr_fractional_shares:
+                    qty = int(qty)
+                contract = Stock(symbol, "SMART", "USD")
+                qualified = self._client.qualifyContracts(contract)
+                if not qualified:
+                    raise ValueError(f"Could not qualify IBKR contract for {symbol}")
+                order = MarketOrder(side, qty)
+                if self.settings.ibkr_account:
+                    order.account = self.settings.ibkr_account
+                trade = self._client.placeOrder(qualified[0], order)
+                response = {
+                    "symbol": symbol,
+                    "side": side.lower(),
+                    "status": "submitted",
+                    "order_id": str(getattr(getattr(trade, "order", None), "orderId", "")),
+                }
+                log_event("order_submitted", paper_mode=self.paper, dry_run=False, details=response)
+            except Exception as exc:
+                response = {"symbol": symbol, "side": side.lower(), "status": "failed", "error": str(exc)}
+                log_event("order_failed", paper_mode=self.paper, dry_run=False, details=response)
+                responses.append(response)
+                if side == "SELL":
+                    return responses
+                continue
+            responses.append(response)
+        return responses
+
+    def _validate_preview_freshness(self, preview_created_at: str | None) -> None:
         if not preview_created_at:
             raise PermissionError("Preview timestamp is missing; regenerate preview before execution.")
         try:
@@ -291,69 +655,4 @@ class AlpacaService:
             raise PermissionError("Preview is stale; regenerate preview before execution.")
 
     def _validate_executable_preview(self, executable: pd.DataFrame) -> None:
-        if executable.empty:
-            return
-
-        symbols = executable["symbol"].dropna().astype(str).tolist()
-        account = self.get_account_status()
-        positions = self.get_positions()
-        fresh_prices = self.get_prices(symbols)
-        asset_metadata = self.get_asset_metadata(symbols)
-        total_buy_notional = 0.0
-        total_sell_notional = 0.0
-
-        for _, row in executable.iterrows():
-            symbol = str(row.get("symbol") or "").upper().strip()
-            side = str(row.get("side") or "").lower()
-            qty = abs(float(row.get("delta_shares") or 0))
-            warnings = str(row.get("warnings") or "").strip()
-            price = row.get("estimated_price")
-            notional = row.get("estimated_notional")
-            fresh_price = fresh_prices.get(symbol, {}).get("price")
-
-            if not symbol:
-                raise PermissionError("Executable preview row is missing a symbol.")
-            if warnings:
-                raise PermissionError(f"{symbol} has unresolved warnings: {warnings}")
-            if qty <= 0:
-                raise PermissionError(f"{symbol} has non-positive order quantity.")
-            if price is None or pd.isna(price) or float(price) <= 0:
-                raise PermissionError(f"{symbol} is missing a valid execution price.")
-            if notional is None or pd.isna(notional) or float(notional) <= 0:
-                raise PermissionError(f"{symbol} is missing a valid execution notional.")
-            if fresh_price is None or float(fresh_price) <= 0:
-                raise PermissionError(f"{symbol} is missing a fresh execution-time price.")
-            fresh_notional = qty * float(fresh_price)
-            preview_notional = float(notional)
-            if preview_notional > 0 and abs(fresh_notional - preview_notional) / preview_notional > 0.05:
-                raise PermissionError(f"{symbol} price moved more than 5%; regenerate preview.")
-
-            asset = asset_metadata.get(symbol)
-            if not asset or not asset.get("tradable") or str(asset.get("asset_status")).lower() != "active":
-                raise PermissionError(f"{symbol} is not active and tradable at execution time.")
-
-            if side == "sell":
-                current_qty = float(positions.get(symbol, 0.0))
-                if qty > current_qty:
-                    raise PermissionError(f"{symbol} sell quantity exceeds current position.")
-                total_sell_notional += fresh_notional
-            elif side == "buy":
-                total_buy_notional += fresh_notional
-
-        buying_power = 0.0
-        if account.account:
-            buying_power = float(account.account.get("buying_power") or 0)
-        if total_buy_notional > buying_power + total_sell_notional:
-            raise PermissionError("Preview buy notional exceeds buying power plus sell proceeds.")
-
-        log_event(
-            "order_preflight_passed",
-            paper_mode=self.paper,
-            dry_run=False,
-            details={
-                "orders": len(executable),
-                "checked_at": datetime.now(UTC).isoformat(),
-                "buy_notional": total_buy_notional,
-                "sell_notional": total_sell_notional,
-            },
-        )
+        _validate_executable_preview_for_service(self, executable)

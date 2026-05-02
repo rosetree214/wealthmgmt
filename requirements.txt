@@ -1,6 +1,7 @@
 streamlit
 edgartools
 alpaca-py
+ib-insync
 yfinance
 python-dotenv
 pandas

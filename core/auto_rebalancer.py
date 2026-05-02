@@ -14,7 +14,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from core.config import load_config
 from core.portfolio_scaler import calculate_scaled_targets
 from core.sec13f_fetcher import FilingMetadata, fetch_latest_13f_holdings, get_latest_filing_metadata
-from core.trade_executor import AlpacaService
+from core.trade_executor import get_broker_service
 from utils.helpers import dataframe_hash, log_event, normalize_cik, read_json, send_notifications, write_json
 
 STATE_PATH = Path("state/last_filings.json")
@@ -231,8 +231,8 @@ def run_rebalance_once(
 
     latest, holdings = fetch_latest_13f_holdings(normalized, settings=config)
     scaled = calculate_scaled_targets(holdings, target_portfolio_size)
-    alpaca = AlpacaService(config)
-    prices = alpaca.get_prices(scaled["ticker"].dropna().astype(str).tolist())
+    broker = get_broker_service(config)
+    prices = broker.get_prices(scaled["ticker"].dropna().astype(str).tolist())
     if prices:
         scaled["current_price"] = scaled["ticker"].map(lambda symbol: prices.get(str(symbol), {}).get("price"))
         scaled["price_source"] = scaled["ticker"].map(lambda symbol: prices.get(str(symbol), {}).get("source"))
@@ -240,7 +240,7 @@ def run_rebalance_once(
             lambda symbol: prices.get(str(symbol), {}).get("timestamp")
         )
 
-    assets = alpaca.get_asset_metadata(scaled["ticker"].dropna().astype(str).tolist())
+    assets = broker.get_asset_metadata(scaled["ticker"].dropna().astype(str).tolist())
     for column in ["tradable", "asset_status", "fractionable"]:
         scaled[column] = scaled["ticker"].map(
             lambda symbol, col=column: assets.get(str(symbol), {}).get(col)
@@ -249,8 +249,8 @@ def run_rebalance_once(
     scaled["asset_status"] = scaled["asset_status"].fillna("unknown")
     scaled["fractionable"] = scaled["fractionable"].fillna(False)
 
-    positions = alpaca.get_positions()
-    preview = alpaca.build_trade_preview(scaled, positions)
+    positions = broker.get_positions()
+    preview = broker.build_trade_preview(scaled, positions)
     accession_safe = latest.accession_number.replace("-", "")
     preview_path = Path("history") / f"rebalance_{normalized}_{accession_safe}.json"
     payload = {
@@ -284,7 +284,7 @@ def run_rebalance_once(
     warnings: list[str] = []
     result_dry_run = dry_run or not config.auto_execute
     if not dry_run and config.auto_execute:
-        executed = alpaca.submit_orders(preview)
+        executed = broker.submit_orders(preview)
     elif not dry_run and not config.auto_execute:
         warnings.append("Execution was requested, but AUTO_EXECUTE is false; preview only.")
     else:

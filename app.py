@@ -10,14 +10,14 @@ from core.auto_rebalancer import run_rebalance_once, start_scheduler
 from core.config import load_config
 from core.portfolio_scaler import calculate_scaled_targets
 from core.sec13f_fetcher import fetch_latest_13f_holdings
-from core.trade_executor import AlpacaService
+from core.trade_executor import get_broker_service
 from utils.helpers import dataframe_hash, money, pct, read_recent_history
 
 
 DISCLAIMER = """
 **Important:** Form 13F filings are delayed, can omit short positions and many non-U.S.
 securities, and do not show current intent. This app is not investment advice and is
-not a recommendation to trade. Trading defaults to Alpaca paper trading and dry-run
+not a recommendation to trade. Trading defaults to paper/read-only broker mode and dry-run
 automation.
 """
 
@@ -61,7 +61,7 @@ def initialize_state() -> None:
     st.session_state.setdefault("authenticated", False)
 
 
-def clear_alpaca_session_state() -> None:
+def clear_broker_session_state() -> None:
     st.session_state.preview = None
     st.session_state.preview_hash = None
     st.session_state.preview_created_at = None
@@ -72,7 +72,7 @@ def require_app_auth(config) -> bool:
         if st.session_state.authenticated:
             return True
 
-        st.sidebar.warning("Authentication is required before Alpaca account data or trading controls are available.")
+        st.sidebar.warning("Authentication is required before broker account data or trading controls are available.")
         password = st.sidebar.text_input("App password", type="password")
         if st.sidebar.button("Unlock app"):
             if hmac.compare_digest(password, config.app_password):
@@ -81,12 +81,12 @@ def require_app_auth(config) -> bool:
             st.sidebar.error("Invalid app password.")
         return False
 
-    if config.alpaca_configured:
-        st.sidebar.error("Set APP_PASSWORD before using configured Alpaca credentials.")
-        st.error("Alpaca credentials are configured, but APP_PASSWORD is missing. The app is locked fail-closed.")
+    if config.alpaca_configured or config.ibkr_configured:
+        st.sidebar.error("Set APP_PASSWORD before using configured broker credentials.")
+        st.error("Broker credentials are configured, but APP_PASSWORD is missing. The app is locked fail-closed.")
         return False
 
-    st.sidebar.warning("Set APP_PASSWORD to unlock Alpaca features. Holdings-only use remains available without Alpaca keys.")
+    st.sidebar.warning("Set APP_PASSWORD to unlock broker features. Holdings-only use remains available without broker credentials.")
     return False
 
 
@@ -97,10 +97,10 @@ def main() -> None:
     config = load_config()
     authenticated = require_app_auth(config)
     if not authenticated:
-        clear_alpaca_session_state()
-    alpaca = AlpacaService(config) if authenticated else None
+        clear_broker_session_state()
+    broker = get_broker_service(config) if authenticated else None
 
-    st.markdown('<div class="hero"><h1>13F Mirror Trader</h1><p>Scale public 13F holdings into a target portfolio and preview guarded Alpaca trades.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>13F Mirror Trader</h1><p>Scale public 13F holdings into a target portfolio and preview guarded broker trades.</p></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="risk">{DISCLAIMER}</div>', unsafe_allow_html=True)
 
     with st.sidebar:
@@ -124,21 +124,23 @@ def main() -> None:
         full_account_confirm = st.checkbox("I understand this can sell holdings outside the 13F portfolio")
         st.divider()
         st.write("**Mode**")
-        st.success("Paper trading ON" if config.alpaca_paper else "Live mode requested")
-        if not config.alpaca_paper:
+        paper_mode = config.ibkr_paper if config.broker == "ibkr" else config.alpaca_paper
+        st.write(f"Broker: **{config.broker.upper()}**")
+        st.success("Paper/read-only mode ON" if paper_mode else "Live mode requested")
+        if not paper_mode:
             st.error("Live trading requires environment safety flags and an additional confirmation.")
         st.write("Dry-run automation is the default.")
 
-    status = alpaca.get_account_status() if alpaca else None
+    status = broker.get_account_status() if broker else None
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Alpaca", "Locked" if not authenticated else ("Configured" if status and status.configured else "Not configured"))
-    col2.metric("Paper mode", "Yes" if config.alpaca_paper else "No")
+    col1.metric(config.broker.upper(), "Locked" if not authenticated else ("Configured" if status and status.configured else "Not configured"))
+    col2.metric("Paper/read-only", "Yes" if (config.ibkr_paper if config.broker == "ibkr" else config.alpaca_paper) else "No")
     col3.metric("Buying power", money(status.account.get("buying_power")) if status and status.account else "-")
     col4.metric("Portfolio value", money(status.account.get("portfolio_value")) if status and status.account else "-")
     if not authenticated:
-        st.info("Enter APP_PASSWORD in the sidebar to unlock Alpaca account status, trade preview, and execution controls.")
+        st.info("Enter APP_PASSWORD in the sidebar to unlock broker account status, trade preview, and execution controls.")
     elif not status.configured:
-        st.info("Alpaca keys are missing or unavailable. Holdings and scaled targets still work; comparison and execution are disabled.")
+        st.info("Broker credentials or gateway connection are missing/unavailable. Holdings and scaled targets still work; comparison and execution are disabled.")
     else:
         st.caption(status.message)
 
@@ -168,7 +170,7 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Force rebalance failed safely: {exc}")
     elif force_clicked:
-        st.error("Unlock the app before running an Alpaca-backed rebalance job.")
+        st.error("Unlock the app before running a broker-backed rebalance job.")
 
     metadata = st.session_state.metadata
     holdings = st.session_state.holdings
@@ -203,7 +205,7 @@ def main() -> None:
         st.plotly_chart(fig, use_container_width=True)
 
         symbols = targets["ticker"].dropna().astype(str).tolist()
-        prices = alpaca.get_prices(symbols) if alpaca else {}
+        prices = broker.get_prices(symbols) if broker else {}
         enriched = targets.copy()
         if prices:
             enriched["current_price"] = enriched["ticker"].map(lambda s: prices.get(str(s), {}).get("price"))
@@ -214,7 +216,7 @@ def main() -> None:
             enriched["price_source"] = None
             enriched["price_timestamp"] = None
             st.warning("No current prices are available yet. Trading rows without prices will be skipped.")
-        assets = alpaca.get_asset_metadata(symbols) if alpaca else {}
+        assets = broker.get_asset_metadata(symbols) if broker else {}
         for column, fallback in [("tradable", False), ("asset_status", "unknown"), ("fractionable", False)]:
             enriched[column] = enriched["ticker"].map(lambda s, c=column: assets.get(str(s), {}).get(c, fallback))
             enriched[column] = enriched[column].fillna(fallback)
@@ -235,11 +237,11 @@ def main() -> None:
         if st.session_state.targets is None:
             st.error("Fetch a filing before previewing trades.")
         elif not authenticated:
-            st.error("Unlock the app before previewing Alpaca trades.")
+            st.error("Unlock the app before previewing broker trades.")
         elif not status or not status.configured:
-            st.error("Execution preview requires Alpaca keys for positions and asset metadata. Scaled targets remain available above.")
+            st.error("Execution preview requires a configured broker for positions and asset metadata. Scaled targets remain available above.")
         else:
-            preview = alpaca.build_preview(
+            preview = broker.build_preview(
                 st.session_state.targets,
                 min_trade_notional=min_trade,
                 full_account_rebalance=full_account and full_account_confirm,
@@ -265,24 +267,25 @@ def main() -> None:
 
         st.subheader("Execute trades")
         live_confirm = True
-        if not config.alpaca_paper:
+        paper_mode = config.ibkr_paper if config.broker == "ibkr" else config.alpaca_paper
+        if not paper_mode:
             st.error("LIVE TRADING MODE REQUESTED. Verify all safeguards before proceeding.")
             live_confirm = st.checkbox("I explicitly confirm live trading")
         confirm = st.checkbox("I confirm, execute these trades")
         current_hash = dataframe_hash(preview.to_dict(orient="records"))
         can_execute = (
             authenticated
-            and alpaca is not None
+            and broker is not None
             and status is not None
             and status.configured
             and confirm
             and current_hash == st.session_state.preview_hash
             and not insufficient
-            and (config.alpaca_paper or (config.allow_live_trading and live_confirm))
+            and (paper_mode or (config.allow_live_trading and live_confirm))
         )
         if st.button("Execute Trades", disabled=not can_execute):
             try:
-                responses = alpaca.submit_preview_orders(
+                responses = broker.submit_preview_orders(
                     preview,
                     st.session_state.preview_hash,
                     current_hash,
@@ -303,7 +306,7 @@ def main() -> None:
             st.caption("No rebalance history yet.")
     else:
         st.subheader("Recent rebalance history")
-        st.caption("Unlock the app to view rebalance history because it may contain Alpaca-derived position data.")
+        st.caption("Unlock the app to view rebalance history because it may contain broker-derived position data.")
 
     with st.expander("Start local development scheduler"):
         st.warning("This blocks the Streamlit process and is for local development only. Use the CLI for production scheduling.")
@@ -311,7 +314,7 @@ def main() -> None:
         if st.button("Start APScheduler loop", disabled=not authenticated):
             start_scheduler(interval)
         if not authenticated:
-            st.caption("Unlock the app before starting the Alpaca-backed scheduler.")
+            st.caption("Unlock the app before starting the broker-backed scheduler.")
 
 
 if __name__ == "__main__":

@@ -55,9 +55,15 @@ def normalize_cik(cik: str | int) -> str:
 class AppConfig:
     edgar_identity: str | None
     app_password: str | None
+    broker: str
     alpaca_api_key: str | None
     alpaca_secret_key: str | None
     alpaca_paper: bool
+    ibkr_host: str
+    ibkr_port: int
+    ibkr_client_id: int
+    ibkr_account: str | None
+    ibkr_read_only: bool
     target_portfolio_size: float
     default_cik: str
     auto_execute: bool
@@ -80,6 +86,18 @@ class AppConfig:
         return bool(self.alpaca_api_key and self.alpaca_secret_key)
 
     @property
+    def ibkr_configured(self) -> bool:
+        return self.broker == "ibkr" and bool(self.ibkr_host and self.ibkr_port)
+
+    @property
+    def ibkr_paper(self) -> bool:
+        return self.ibkr_port == 7497
+
+    @property
+    def ibkr_fractional_shares(self) -> bool:
+        return False
+
+    @property
     def has_alpaca_keys(self) -> bool:
         return self.alpaca_configured
 
@@ -89,7 +107,7 @@ class AppConfig:
 
     @property
     def requires_app_auth(self) -> bool:
-        return self.alpaca_configured or bool(self.app_password)
+        return self.alpaca_configured or self.ibkr_configured or bool(self.app_password)
 
 
 def load_config() -> AppConfig:
@@ -102,9 +120,15 @@ def load_config() -> AppConfig:
     return AppConfig(
         edgar_identity=get("EDGAR_IDENTITY") or None,
         app_password=get("APP_PASSWORD") or None,
+        broker=str(get("BROKER", "alpaca")).strip().lower(),
         alpaca_api_key=get("ALPACA_API_KEY") or None,
         alpaca_secret_key=get("ALPACA_SECRET_KEY") or None,
         alpaca_paper=_get_bool(get("ALPACA_PAPER"), True),
+        ibkr_host=get("IBKR_HOST", "127.0.0.1"),
+        ibkr_port=_get_int(get("IBKR_PORT"), 7497),
+        ibkr_client_id=_get_int(get("IBKR_CLIENT_ID"), 13),
+        ibkr_account=get("IBKR_ACCOUNT") or None,
+        ibkr_read_only=_get_bool(get("IBKR_READ_ONLY"), True),
         target_portfolio_size=_get_float(get("TARGET_PORTFOLIO_SIZE"), 10_000.0),
         default_cik=normalize_cik(get("DEFAULT_CIK", "0002045724")),
         auto_execute=_get_bool(get("AUTO_EXECUTE"), False),
