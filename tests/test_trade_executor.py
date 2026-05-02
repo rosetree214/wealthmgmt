@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pandas as pd
 import pytest
 
@@ -25,7 +27,42 @@ def _config() -> AppConfig:
         email_from=None,
         email_to=None,
         slack_webhook_url=None,
+        app_password=None,
+        preview_ttl_seconds=300,
     )
+
+
+def _preview_row(symbol: str = "AAA", side: str = "buy") -> pd.DataFrame:
+    delta = 1 if side == "buy" else -1
+    return pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "side": side,
+                "delta_shares": delta,
+                "estimated_price": 10,
+                "estimated_notional": 10,
+                "warnings": "",
+            }
+        ]
+    )
+
+
+def _ready_service(config: AppConfig | None = None) -> AlpacaService:
+    service = AlpacaService(config or _config())
+    service._client = object()
+    service.get_account_status = lambda: type(
+        "Status",
+        (),
+        {"account": {"buying_power": 1000.0}},
+    )()
+    service.get_positions = lambda: {"AAA": 10.0}
+    service.get_asset_metadata = lambda symbols: {
+        symbol: {"tradable": True, "asset_status": "active", "fractionable": True}
+        for symbol in symbols
+    }
+    service.get_prices = lambda symbols: {symbol: {"price": 10.0} for symbol in symbols}
+    return service
 
 
 def test_executor_rejects_rows_with_safety_warnings_before_submission():
@@ -45,7 +82,13 @@ def test_executor_rejects_rows_with_safety_warnings_before_submission():
     )
 
     with pytest.raises(PermissionError, match="warnings"):
-        service.submit_preview_orders(preview, "same", "same", confirm=True)
+        service.submit_preview_orders(
+            preview,
+            "same",
+            "same",
+            confirm=True,
+            preview_created_at=datetime.now(UTC).isoformat(),
+        )
 
 
 def test_executor_rejects_sell_larger_than_current_position(monkeypatch):
@@ -66,9 +109,72 @@ def test_executor_rejects_sell_larger_than_current_position(monkeypatch):
     )
 
     with pytest.raises(PermissionError, match="exceeds current position"):
-        monkeypatch.setattr(
-            service,
-            "get_asset_metadata",
-            lambda symbols: {"AAA": {"tradable": True, "asset_status": "active", "fractionable": True}},
+        service.get_asset_metadata = lambda symbols: {
+            "AAA": {"tradable": True, "asset_status": "active", "fractionable": True}
+        }
+        service.get_prices = lambda symbols: {"AAA": {"price": 10.0}}
+        service.submit_preview_orders(
+            preview,
+            "same",
+            "same",
+            confirm=True,
+            preview_created_at=datetime.now(UTC).isoformat(),
         )
-        service.submit_preview_orders(preview, "same", "same", confirm=True)
+
+
+def test_executor_rejects_stale_preview_before_submission():
+    service = _ready_service()
+    stale = datetime.now(UTC) - timedelta(minutes=10)
+
+    with pytest.raises(PermissionError, match="stale"):
+        service.submit_preview_orders(
+            _preview_row(),
+            "same",
+            "same",
+            confirm=True,
+            preview_created_at=stale.isoformat(),
+        )
+
+
+def test_executor_uses_configured_preview_ttl():
+    config = _config().__class__(**{**_config().__dict__, "preview_ttl_seconds": 30})
+    service = _ready_service(config)
+    stale = datetime.now(UTC) - timedelta(seconds=31)
+
+    with pytest.raises(PermissionError, match="stale"):
+        service.submit_preview_orders(
+            _preview_row(),
+            "same",
+            "same",
+            confirm=True,
+            preview_created_at=stale.isoformat(),
+        )
+
+
+def test_executor_rejects_live_without_live_confirmation():
+    live_config = _config().__class__(**{**_config().__dict__, "alpaca_paper": False, "allow_live_trading": True})
+    service = _ready_service(live_config)
+
+    with pytest.raises(PermissionError, match="Live trading requires explicit live confirmation"):
+        service.submit_preview_orders(
+            _preview_row(),
+            "same",
+            "same",
+            confirm=True,
+            preview_created_at=datetime.now(UTC).isoformat(),
+            live_confirm=False,
+        )
+
+
+def test_executor_rejects_execution_time_price_move():
+    service = _ready_service()
+    service.get_prices = lambda symbols: {"AAA": {"price": 20.0}}
+
+    with pytest.raises(PermissionError, match="price moved"):
+        service.submit_preview_orders(
+            _preview_row(),
+            "same",
+            "same",
+            confirm=True,
+            preview_created_at=datetime.now(UTC).isoformat(),
+        )

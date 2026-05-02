@@ -2,6 +2,7 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 .env
+.streamlit/secrets.toml
 logs/*.jsonl
 history/*.json
 state/*.json

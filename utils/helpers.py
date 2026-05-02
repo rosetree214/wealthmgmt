@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import smtplib
+import socket
 from datetime import UTC, date, datetime
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -130,19 +133,48 @@ def dataframe_hash(records: list[dict[str, Any]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _host_is_public(hostname: str) -> bool:
+    try:
+        addresses = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
+def _valid_slack_webhook(url: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in {"hooks.slack.com", "hooks.slack-gov.com"}
+        and _host_is_public(parsed.hostname)
+    )
+
+
+def _valid_smtp_host(hostname: str) -> bool:
+    return bool(hostname and _host_is_public(hostname))
+
+
 def send_notifications(subject: str, body: str, config: Any) -> list[str]:
     outcomes: list[str] = []
     if getattr(config, "slack_webhook_url", ""):
-        try:
-            response = requests.post(
-                config.slack_webhook_url,
-                json={"text": f"*{subject}*\n{body}"},
-                timeout=15,
-            )
-            response.raise_for_status()
-            outcomes.append("slack_sent")
-        except Exception as exc:  # pragma: no cover - external service
-            outcomes.append(f"slack_failed: {exc}")
+        if not _valid_slack_webhook(config.slack_webhook_url):
+            outcomes.append("slack_skipped_invalid_destination")
+        else:
+            try:
+                response = requests.post(
+                    config.slack_webhook_url,
+                    json={"text": f"*{subject}*\n{body}"},
+                    timeout=15,
+                )
+                response.raise_for_status()
+                outcomes.append("slack_sent")
+            except Exception:  # pragma: no cover - external service
+                outcomes.append("slack_failed")
 
     smtp_ready = all(
         [
@@ -153,20 +185,23 @@ def send_notifications(subject: str, body: str, config: Any) -> list[str]:
         ]
     )
     if smtp_ready:
-        try:
-            message = EmailMessage()
-            message["Subject"] = subject
-            message["From"] = config.email_from
-            message["To"] = config.email_to
-            message.set_content(body)
-            with smtplib.SMTP(config.smtp_host, int(config.smtp_port), timeout=20) as smtp:
-                if getattr(config, "smtp_username", ""):
-                    smtp.starttls()
-                    smtp.login(config.smtp_username, config.smtp_password)
-                smtp.send_message(message)
-            outcomes.append("email_sent")
-        except Exception as exc:  # pragma: no cover - external service
-            outcomes.append(f"email_failed: {exc}")
+        if not _valid_smtp_host(config.smtp_host):
+            outcomes.append("email_skipped_invalid_destination")
+        else:
+            try:
+                message = EmailMessage()
+                message["Subject"] = subject
+                message["From"] = config.email_from
+                message["To"] = config.email_to
+                message.set_content(body)
+                with smtplib.SMTP(config.smtp_host, int(config.smtp_port), timeout=20) as smtp:
+                    if getattr(config, "smtp_username", ""):
+                        smtp.starttls()
+                        smtp.login(config.smtp_username, config.smtp_password)
+                    smtp.send_message(message)
+                outcomes.append("email_sent")
+            except Exception:  # pragma: no cover - external service
+                outcomes.append("email_failed")
 
     if not outcomes:
         outcomes.append("notifications_skipped")

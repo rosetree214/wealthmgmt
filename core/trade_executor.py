@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -9,6 +9,9 @@ import pandas as pd
 from core.config import AppConfig
 from core.portfolio_scaler import generate_trade_preview
 from utils.helpers import log_event
+
+
+PREVIEW_TTL_SECONDS = 300
 
 try:
     from alpaca.trading.client import TradingClient
@@ -204,7 +207,15 @@ class AlpacaService:
             self.settings.allow_live_trading and self.settings.allow_live_auto_execute
         ):
             raise PermissionError("Automated live trading is disabled by safety gates.")
-        return self.submit_preview_orders(preview, "auto", "auto", confirm=True, automated=True)
+        return self.submit_preview_orders(
+            preview,
+            "auto",
+            "auto",
+            confirm=True,
+            automated=True,
+            preview_created_at=datetime.now(UTC).isoformat(),
+            live_confirm=self.settings.allow_live_auto_execute,
+        )
 
     def submit_preview_orders(
         self,
@@ -213,15 +224,20 @@ class AlpacaService:
         current_hash: str,
         confirm: bool,
         automated: bool = False,
+        preview_created_at: str | None = None,
+        live_confirm: bool = False,
     ) -> list[dict[str, Any]]:
         if not confirm:
             raise PermissionError("Execution requires explicit user confirmation.")
         if not automated and preview_hash != current_hash:
             raise PermissionError("Preview hash changed; regenerate preview before execution.")
+        self._validate_preview_freshness(preview_created_at)
         if not self.configured:
             raise PermissionError("Alpaca credentials are required for execution.")
         if not self.paper and not self.settings.allow_live_trading:
             raise PermissionError("Live trading requires ALLOW_LIVE_TRADING=true.")
+        if not self.paper and not live_confirm:
+            raise PermissionError("Live trading requires explicit live confirmation.")
 
         executable = preview[preview["side"].isin(["sell", "buy"])].copy()
         self._validate_executable_preview(executable)
@@ -261,12 +277,28 @@ class AlpacaService:
             responses.append(response)
         return responses
 
+    def _validate_preview_freshness(self, preview_created_at: str | None) -> None:
+        if not preview_created_at:
+            raise PermissionError("Preview timestamp is missing; regenerate preview before execution.")
+        try:
+            created_at = datetime.fromisoformat(str(preview_created_at).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PermissionError("Preview timestamp is invalid; regenerate preview before execution.") from exc
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        ttl_seconds = max(30, min(int(self.settings.preview_ttl_seconds), PREVIEW_TTL_SECONDS))
+        if datetime.now(UTC) - created_at > timedelta(seconds=ttl_seconds):
+            raise PermissionError("Preview is stale; regenerate preview before execution.")
+
     def _validate_executable_preview(self, executable: pd.DataFrame) -> None:
         if executable.empty:
             return
 
+        symbols = executable["symbol"].dropna().astype(str).tolist()
         account = self.get_account_status()
         positions = self.get_positions()
+        fresh_prices = self.get_prices(symbols)
+        asset_metadata = self.get_asset_metadata(symbols)
         total_buy_notional = 0.0
         total_sell_notional = 0.0
 
@@ -277,6 +309,7 @@ class AlpacaService:
             warnings = str(row.get("warnings") or "").strip()
             price = row.get("estimated_price")
             notional = row.get("estimated_notional")
+            fresh_price = fresh_prices.get(symbol, {}).get("price")
 
             if not symbol:
                 raise PermissionError("Executable preview row is missing a symbol.")
@@ -288,8 +321,14 @@ class AlpacaService:
                 raise PermissionError(f"{symbol} is missing a valid execution price.")
             if notional is None or pd.isna(notional) or float(notional) <= 0:
                 raise PermissionError(f"{symbol} is missing a valid execution notional.")
+            if fresh_price is None or float(fresh_price) <= 0:
+                raise PermissionError(f"{symbol} is missing a fresh execution-time price.")
+            fresh_notional = qty * float(fresh_price)
+            preview_notional = float(notional)
+            if preview_notional > 0 and abs(fresh_notional - preview_notional) / preview_notional > 0.05:
+                raise PermissionError(f"{symbol} price moved more than 5%; regenerate preview.")
 
-            asset = self.get_asset_metadata([symbol]).get(symbol)
+            asset = asset_metadata.get(symbol)
             if not asset or not asset.get("tradable") or str(asset.get("asset_status")).lower() != "active":
                 raise PermissionError(f"{symbol} is not active and tradable at execution time.")
 
@@ -297,9 +336,9 @@ class AlpacaService:
                 current_qty = float(positions.get(symbol, 0.0))
                 if qty > current_qty:
                     raise PermissionError(f"{symbol} sell quantity exceeds current position.")
-                total_sell_notional += float(notional)
+                total_sell_notional += fresh_notional
             elif side == "buy":
-                total_buy_notional += float(notional)
+                total_buy_notional += fresh_notional
 
         buying_power = 0.0
         if account.account:

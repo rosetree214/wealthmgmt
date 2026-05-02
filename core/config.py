@@ -54,6 +54,7 @@ def normalize_cik(cik: str | int) -> str:
 @dataclass(frozen=True)
 class AppConfig:
     edgar_identity: str | None
+    app_password: str | None
     alpaca_api_key: str | None
     alpaca_secret_key: str | None
     alpaca_paper: bool
@@ -63,6 +64,7 @@ class AppConfig:
     allow_live_trading: bool
     allow_live_auto_execute: bool
     min_trade_notional: float
+    preview_ttl_seconds: int
     rebalance_interval_hours: int
     smtp_host: str | None
     smtp_port: int | None
@@ -84,6 +86,10 @@ class AppConfig:
     def live_trading_enabled(self) -> bool:
         return not self.alpaca_paper and self.allow_live_trading
 
+    @property
+    def requires_app_auth(self) -> bool:
+        return self.alpaca_configured or bool(self.app_password)
+
 
 def load_config() -> AppConfig:
     load_dotenv(BASE_DIR / ".env")
@@ -94,6 +100,7 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         edgar_identity=get("EDGAR_IDENTITY") or None,
+        app_password=get("APP_PASSWORD") or None,
         alpaca_api_key=get("ALPACA_API_KEY") or None,
         alpaca_secret_key=get("ALPACA_SECRET_KEY") or None,
         alpaca_paper=_get_bool(get("ALPACA_PAPER"), True),
@@ -103,6 +110,7 @@ def load_config() -> AppConfig:
         allow_live_trading=_get_bool(get("ALLOW_LIVE_TRADING"), False),
         allow_live_auto_execute=_get_bool(get("ALLOW_LIVE_AUTO_EXECUTE"), False),
         min_trade_notional=_get_float(get("MIN_TRADE_NOTIONAL"), 10.0),
+        preview_ttl_seconds=_get_int(get("PREVIEW_TTL_SECONDS"), 300),
         rebalance_interval_hours=_get_int(get("REBALANCE_INTERVAL_HOURS"), 1),
         smtp_host=get("SMTP_HOST") or None,
         smtp_port=_get_int(get("SMTP_PORT"), 0) or None,

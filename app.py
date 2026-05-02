@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hmac
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -56,6 +58,36 @@ def initialize_state() -> None:
     st.session_state.setdefault("targets", None)
     st.session_state.setdefault("preview", None)
     st.session_state.setdefault("preview_hash", None)
+    st.session_state.setdefault("authenticated", False)
+
+
+def clear_alpaca_session_state() -> None:
+    st.session_state.preview = None
+    st.session_state.preview_hash = None
+    st.session_state.preview_created_at = None
+
+
+def require_app_auth(config) -> bool:
+    if config.app_password:
+        if st.session_state.authenticated:
+            return True
+
+        st.sidebar.warning("Authentication is required before Alpaca account data or trading controls are available.")
+        password = st.sidebar.text_input("App password", type="password")
+        if st.sidebar.button("Unlock app"):
+            if hmac.compare_digest(password, config.app_password):
+                st.session_state.authenticated = True
+                st.rerun()
+            st.sidebar.error("Invalid app password.")
+        return False
+
+    if config.alpaca_configured:
+        st.sidebar.error("Set APP_PASSWORD before using configured Alpaca credentials.")
+        st.error("Alpaca credentials are configured, but APP_PASSWORD is missing. The app is locked fail-closed.")
+        return False
+
+    st.sidebar.warning("Set APP_PASSWORD to unlock Alpaca features. Holdings-only use remains available without Alpaca keys.")
+    return False
 
 
 def main() -> None:
@@ -63,7 +95,10 @@ def main() -> None:
     inject_css()
     initialize_state()
     config = load_config()
-    alpaca = AlpacaService(config)
+    authenticated = require_app_auth(config)
+    if not authenticated:
+        clear_alpaca_session_state()
+    alpaca = AlpacaService(config) if authenticated else None
 
     st.markdown('<div class="hero"><h1>13F Mirror Trader</h1><p>Scale public 13F holdings into a target portfolio and preview guarded Alpaca trades.</p></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="risk">{DISCLAIMER}</div>', unsafe_allow_html=True)
@@ -94,13 +129,15 @@ def main() -> None:
             st.error("Live trading requires environment safety flags and an additional confirmation.")
         st.write("Dry-run automation is the default.")
 
-    status = alpaca.get_account_status()
+    status = alpaca.get_account_status() if alpaca else None
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Alpaca", "Configured" if status.configured else "Not configured")
-    col2.metric("Paper mode", "Yes" if status.paper else "No")
-    col3.metric("Buying power", money(status.account.get("buying_power")) if status.account else "-")
-    col4.metric("Portfolio value", money(status.account.get("portfolio_value")) if status.account else "-")
-    if not status.configured:
+    col1.metric("Alpaca", "Locked" if not authenticated else ("Configured" if status and status.configured else "Not configured"))
+    col2.metric("Paper mode", "Yes" if config.alpaca_paper else "No")
+    col3.metric("Buying power", money(status.account.get("buying_power")) if status and status.account else "-")
+    col4.metric("Portfolio value", money(status.account.get("portfolio_value")) if status and status.account else "-")
+    if not authenticated:
+        st.info("Enter APP_PASSWORD in the sidebar to unlock Alpaca account status, trade preview, and execution controls.")
+    elif not status.configured:
         st.info("Alpaca keys are missing or unavailable. Holdings and scaled targets still work; comparison and execution are disabled.")
     else:
         st.caption(status.message)
@@ -124,12 +161,14 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Could not fetch 13F filing: {exc}")
 
-    if force_clicked:
+    if force_clicked and authenticated:
         try:
             result = run_rebalance_once(cik, target_size, dry_run=True)
             st.success(f"Dry-run rebalance complete: {result}")
         except Exception as exc:
             st.error(f"Force rebalance failed safely: {exc}")
+    elif force_clicked:
+        st.error("Unlock the app before running an Alpaca-backed rebalance job.")
 
     metadata = st.session_state.metadata
     holdings = st.session_state.holdings
@@ -164,7 +203,7 @@ def main() -> None:
         st.plotly_chart(fig, use_container_width=True)
 
         symbols = targets["ticker"].dropna().astype(str).tolist()
-        prices = alpaca.get_prices(symbols)
+        prices = alpaca.get_prices(symbols) if alpaca else {}
         enriched = targets.copy()
         if prices:
             enriched["current_price"] = enriched["ticker"].map(lambda s: prices.get(str(s), {}).get("price"))
@@ -175,7 +214,7 @@ def main() -> None:
             enriched["price_source"] = None
             enriched["price_timestamp"] = None
             st.warning("No current prices are available yet. Trading rows without prices will be skipped.")
-        assets = alpaca.get_asset_metadata(symbols)
+        assets = alpaca.get_asset_metadata(symbols) if alpaca else {}
         for column, fallback in [("tradable", False), ("asset_status", "unknown"), ("fractionable", False)]:
             enriched[column] = enriched["ticker"].map(lambda s, c=column: assets.get(str(s), {}).get(c, fallback))
             enriched[column] = enriched[column].fillna(fallback)
@@ -195,7 +234,9 @@ def main() -> None:
     if preview_clicked:
         if st.session_state.targets is None:
             st.error("Fetch a filing before previewing trades.")
-        elif not status.configured:
+        elif not authenticated:
+            st.error("Unlock the app before previewing Alpaca trades.")
+        elif not status or not status.configured:
             st.error("Execution preview requires Alpaca keys for positions and asset metadata. Scaled targets remain available above.")
         else:
             preview = alpaca.build_preview(
@@ -206,9 +247,10 @@ def main() -> None:
             records = preview.to_dict(orient="records")
             st.session_state.preview = preview
             st.session_state.preview_hash = dataframe_hash(records)
+            st.session_state.preview_created_at = pd.Timestamp.utcnow().isoformat()
 
-    preview = st.session_state.preview
-    if preview is not None:
+    preview = st.session_state.preview if authenticated else None
+    if authenticated and preview is not None:
         st.subheader("Trade preview")
         total_buys = float(preview.loc[preview["side"] == "buy", "estimated_notional"].fillna(0).sum())
         total_sells = float(preview.loc[preview["side"] == "sell", "estimated_notional"].fillna(0).sum())
@@ -216,7 +258,7 @@ def main() -> None:
         st.write(f"Estimated buys: {money(total_buys)} | estimated sells: {money(total_sells)}")
         st.dataframe(preview, use_container_width=True, hide_index=True)
 
-        buying_power = status.account.get("buying_power", 0) if status.account else 0
+        buying_power = status.account.get("buying_power", 0) if status and status.account else 0
         insufficient = total_buys > float(buying_power) + total_sells
         if insufficient:
             st.warning("Estimated buys exceed available buying power plus previewed sells.")
@@ -229,7 +271,10 @@ def main() -> None:
         confirm = st.checkbox("I confirm, execute these trades")
         current_hash = dataframe_hash(preview.to_dict(orient="records"))
         can_execute = (
-            status.configured
+            authenticated
+            and alpaca is not None
+            and status is not None
+            and status.configured
             and confirm
             and current_hash == st.session_state.preview_hash
             and not insufficient
@@ -237,23 +282,36 @@ def main() -> None:
         )
         if st.button("Execute Trades", disabled=not can_execute):
             try:
-                responses = alpaca.submit_preview_orders(preview, st.session_state.preview_hash, current_hash, confirm)
+                responses = alpaca.submit_preview_orders(
+                    preview,
+                    st.session_state.preview_hash,
+                    current_hash,
+                    confirm,
+                    preview_created_at=st.session_state.get("preview_created_at"),
+                    live_confirm=live_confirm,
+                )
                 st.write(responses)
             except Exception as exc:
                 st.error(f"Execution failed safely: {exc}")
 
-    st.subheader("Recent rebalance history")
-    history = read_recent_history()
-    if history:
-        st.dataframe(pd.DataFrame(history), use_container_width=True)
+    if authenticated:
+        st.subheader("Recent rebalance history")
+        history = read_recent_history()
+        if history:
+            st.dataframe(pd.DataFrame(history), use_container_width=True)
+        else:
+            st.caption("No rebalance history yet.")
     else:
-        st.caption("No rebalance history yet.")
+        st.subheader("Recent rebalance history")
+        st.caption("Unlock the app to view rebalance history because it may contain Alpaca-derived position data.")
 
     with st.expander("Start local development scheduler"):
         st.warning("This blocks the Streamlit process and is for local development only. Use the CLI for production scheduling.")
         interval = st.number_input("Interval hours", min_value=1, value=int(config.rebalance_interval_hours))
-        if st.button("Start APScheduler loop"):
+        if st.button("Start APScheduler loop", disabled=not authenticated):
             start_scheduler(interval)
+        if not authenticated:
+            st.caption("Unlock the app before starting the Alpaca-backed scheduler.")
 
 
 if __name__ == "__main__":

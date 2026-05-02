@@ -135,6 +135,8 @@ def test_identifier_to_cik_resolves_manager_names(monkeypatch):
         email_from=None,
         email_to=None,
         slack_webhook_url=None,
+        app_password=None,
+        preview_ttl_seconds=300,
     )
 
     monkeypatch.setattr(
