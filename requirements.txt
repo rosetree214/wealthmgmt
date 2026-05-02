@@ -1,0 +1,10 @@
+streamlit
+edgartools
+alpaca-py
+yfinance
+python-dotenv
+pandas
+APScheduler>=3.10,<4
+plotly
+requests
+pytest
