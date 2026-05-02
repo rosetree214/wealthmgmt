@@ -140,8 +140,8 @@ def _latest_13f_from_edgartools(identifier: str, settings: AppConfig) -> tuple[A
     set_identity(settings.edgar_identity)
 
     company = _resolve_company(identifier, settings)
-    filings = _call_first(company, ["get_filings"], form="13F-HR") or _call_first(
-        company, ["get_filings"], form=["13F-HR", "13F-HR/A"]
+    filings = _call_first(company, ["get_filings"], form=["13F-HR", "13F-HR/A"]) or _call_first(
+        company, ["get_filings"], form="13F-HR"
     )
     if filings is None:
         raise ValueError("Could not query edgartools filings for the selected manager")

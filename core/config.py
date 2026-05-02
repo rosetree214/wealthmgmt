@@ -66,6 +66,7 @@ class AppConfig:
     min_trade_notional: float
     preview_ttl_seconds: int
     rebalance_interval_hours: int
+    scan_form_types: list[str]
     smtp_host: str | None
     smtp_port: int | None
     smtp_username: str | None
@@ -112,6 +113,7 @@ def load_config() -> AppConfig:
         min_trade_notional=_get_float(get("MIN_TRADE_NOTIONAL"), 10.0),
         preview_ttl_seconds=_get_int(get("PREVIEW_TTL_SECONDS"), 300),
         rebalance_interval_hours=_get_int(get("REBALANCE_INTERVAL_HOURS"), 1),
+        scan_form_types=_parse_form_types(get("SCAN_FORM_TYPES"), ["13F-HR", "13F-HR/A"]),
         smtp_host=get("SMTP_HOST") or None,
         smtp_port=_get_int(get("SMTP_PORT"), 0) or None,
         smtp_username=get("SMTP_USERNAME") or None,
@@ -127,4 +129,11 @@ Settings = AppConfig
 
 def get_settings() -> AppConfig:
     return load_config()
+
+
+def _parse_form_types(value: Any, default: list[str]) -> list[str]:
+    if value in (None, ""):
+        return default
+    forms = [str(item).strip().upper() for item in str(value).split(",") if str(item).strip()]
+    return forms or default
 

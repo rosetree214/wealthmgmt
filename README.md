@@ -30,7 +30,8 @@ This project is software tooling, not investment advice.
 - Stores preview hashes so execution cannot use stale previews.
 - Logs JSONL events to `logs/app.jsonl`.
 - Saves rebalance previews to `history/`.
-- Tracks last seen filings in `state/last_filings.json`.
+- Tracks last seen filings in `state/last_filings.json`, keyed by CIK and form type.
+- Scans configurable SEC form types for new filing notifications.
 - Provides a standalone automation CLI suitable for cron-style schedulers.
 
 ## What it does not do
@@ -41,6 +42,7 @@ This project is software tooling, not investment advice.
 - It does not liquidate unrelated holdings unless full-account rebalance is explicitly enabled.
 - It does not trade without Alpaca keys and explicit execution confirmation.
 - It does not make automatic live trading possible by default.
+- It does not mirror non-13F forms. Comparable filings such as Schedule 13D/13G are detection/notification inputs only unless a safe parser is added later.
 
 ## Setup
 
@@ -79,6 +81,12 @@ Automation dry run:
 python -m core.auto_rebalancer --cik 0002045724 --portfolio-size 10000 --once --dry-run
 ```
 
+Scan configured filing forms without generating a rebalance preview:
+
+```bash
+python -m core.auto_rebalancer --cik 0002045724 --scan-only --scan-forms "13F-HR,13F-HR/A,SC 13G"
+```
+
 CLI help:
 
 ```bash
@@ -115,6 +123,22 @@ ALPACA_PAPER=false
 
 The default automation behavior is dry-run preview generation.
 
+## Automatic filing scans
+
+`SCAN_FORM_TYPES` controls which SEC forms the automation watches. The default is:
+
+```bash
+SCAN_FORM_TYPES="13F-HR,13F-HR/A"
+```
+
+You can add comparable filing types for detection and notification:
+
+```bash
+SCAN_FORM_TYPES="13F-HR,13F-HR/A,SC 13G,SC 13G/A,SC 13D,SC 13D/A"
+```
+
+Only 13F-HR filings are parsed into holdings and rebalance previews. Other forms are recorded in `state/last_filings.json` and can send notifications when a new accession number appears.
+
 ## Deployment notes
 
 ### Streamlit Community Cloud
@@ -127,6 +151,12 @@ Command:
 
 ```bash
 python -m core.auto_rebalancer --cik 0002045724 --portfolio-size 10000 --once --dry-run
+```
+
+Detection-only command:
+
+```bash
+python -m core.auto_rebalancer --cik 0002045724 --scan-only --scan-forms "13F-HR,13F-HR/A,SC 13G,SC 13D"
 ```
 
 Use persistent disks if you want `state/last_filings.json` and `history/` to survive redeploys.
@@ -155,7 +185,7 @@ GitHub Actions ephemeral storage means local JSON state will not persist unless 
 
 - `logs/app.jsonl` - structured events
 - `history/rebalance_{cik}_{accession}.json` - rebalance previews
-- `state/last_filings.json` - last seen accession numbers keyed by CIK
+- `state/last_filings.json` - last seen accession numbers keyed by CIK and SEC form type
 
 If deployed to an ephemeral filesystem, use persistent storage or an external state store.
 

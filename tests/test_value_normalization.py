@@ -137,6 +137,7 @@ def test_identifier_to_cik_resolves_manager_names(monkeypatch):
         slack_webhook_url=None,
         app_password=None,
         preview_ttl_seconds=300,
+        scan_form_types=["13F-HR", "13F-HR/A"],
     )
 
     monkeypatch.setattr(

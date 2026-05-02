@@ -26,6 +26,7 @@ def _config(**overrides) -> AppConfig:
         "slack_webhook_url": None,
         "app_password": None,
         "preview_ttl_seconds": 300,
+        "scan_form_types": ["13F-HR", "13F-HR/A"],
     }
     values.update(overrides)
     return AppConfig(**values)
