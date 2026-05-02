@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
@@ -98,10 +99,34 @@ class AlpacaService:
     def get_prices(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
         prices: dict[str, dict[str, Any]] = {}
         unique_symbols = sorted({symbol.upper() for symbol in symbols if symbol})
+        if self.configured:
+            try:
+                from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.requests import StockLatestTradeRequest
+
+                data_client = StockHistoricalDataClient(
+                    self.settings.alpaca_api_key,
+                    self.settings.alpaca_secret_key,
+                )
+                request = StockLatestTradeRequest(symbol_or_symbols=unique_symbols)
+                trades = data_client.get_stock_latest_trade(request)
+                for symbol, trade in trades.items():
+                    price = float(getattr(trade, "price", 0) or 0)
+                    if price > 0:
+                        timestamp = getattr(trade, "timestamp", None)
+                        prices[symbol.upper()] = {
+                            "price": price,
+                            "source": "alpaca",
+                            "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
+                        }
+            except Exception as exc:
+                log_event("alpaca_price_lookup_error", paper_mode=self.paper, details={"error": str(exc)})
+
+        missing_symbols = [symbol for symbol in unique_symbols if symbol not in prices]
         try:
             import yfinance as yf
 
-            for symbol in unique_symbols:
+            for symbol in missing_symbols:
                 ticker = yf.Ticker(symbol)
                 history = ticker.history(period="1d", interval="1m")
                 if history.empty:
@@ -179,7 +204,7 @@ class AlpacaService:
             self.settings.allow_live_trading and self.settings.allow_live_auto_execute
         ):
             raise PermissionError("Automated live trading is disabled by safety gates.")
-        return self.submit_preview_orders(preview, "auto", "auto", confirm=True)
+        return self.submit_preview_orders(preview, "auto", "auto", confirm=True, automated=True)
 
     def submit_preview_orders(
         self,
@@ -187,10 +212,11 @@ class AlpacaService:
         preview_hash: str,
         current_hash: str,
         confirm: bool,
+        automated: bool = False,
     ) -> list[dict[str, Any]]:
         if not confirm:
             raise PermissionError("Execution requires explicit user confirmation.")
-        if preview_hash != current_hash:
+        if not automated and preview_hash != current_hash:
             raise PermissionError("Preview hash changed; regenerate preview before execution.")
         if not self.configured:
             raise PermissionError("Alpaca credentials are required for execution.")
@@ -198,6 +224,7 @@ class AlpacaService:
             raise PermissionError("Live trading requires ALLOW_LIVE_TRADING=true.")
 
         executable = preview[preview["side"].isin(["sell", "buy"])].copy()
+        self._validate_executable_preview(executable)
         executable["_sort"] = executable["side"].map({"sell": 0, "buy": 1})
         executable = executable.sort_values(["_sort", "symbol"])
 
@@ -233,3 +260,61 @@ class AlpacaService:
                 )
             responses.append(response)
         return responses
+
+    def _validate_executable_preview(self, executable: pd.DataFrame) -> None:
+        if executable.empty:
+            return
+
+        account = self.get_account_status()
+        positions = self.get_positions()
+        total_buy_notional = 0.0
+        total_sell_notional = 0.0
+
+        for _, row in executable.iterrows():
+            symbol = str(row.get("symbol") or "").upper().strip()
+            side = str(row.get("side") or "").lower()
+            qty = abs(float(row.get("delta_shares") or 0))
+            warnings = str(row.get("warnings") or "").strip()
+            price = row.get("estimated_price")
+            notional = row.get("estimated_notional")
+
+            if not symbol:
+                raise PermissionError("Executable preview row is missing a symbol.")
+            if warnings:
+                raise PermissionError(f"{symbol} has unresolved warnings: {warnings}")
+            if qty <= 0:
+                raise PermissionError(f"{symbol} has non-positive order quantity.")
+            if price is None or pd.isna(price) or float(price) <= 0:
+                raise PermissionError(f"{symbol} is missing a valid execution price.")
+            if notional is None or pd.isna(notional) or float(notional) <= 0:
+                raise PermissionError(f"{symbol} is missing a valid execution notional.")
+
+            asset = self.get_asset_metadata([symbol]).get(symbol)
+            if not asset or not asset.get("tradable") or str(asset.get("asset_status")).lower() != "active":
+                raise PermissionError(f"{symbol} is not active and tradable at execution time.")
+
+            if side == "sell":
+                current_qty = float(positions.get(symbol, 0.0))
+                if qty > current_qty:
+                    raise PermissionError(f"{symbol} sell quantity exceeds current position.")
+                total_sell_notional += float(notional)
+            elif side == "buy":
+                total_buy_notional += float(notional)
+
+        buying_power = 0.0
+        if account.account:
+            buying_power = float(account.account.get("buying_power") or 0)
+        if total_buy_notional > buying_power + total_sell_notional:
+            raise PermissionError("Preview buy notional exceeds buying power plus sell proceeds.")
+
+        log_event(
+            "order_preflight_passed",
+            paper_mode=self.paper,
+            dry_run=False,
+            details={
+                "orders": len(executable),
+                "checked_at": datetime.now(UTC).isoformat(),
+                "buy_notional": total_buy_notional,
+                "sell_notional": total_sell_notional,
+            },
+        )

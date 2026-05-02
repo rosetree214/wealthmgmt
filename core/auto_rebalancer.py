@@ -136,15 +136,18 @@ def run_rebalance_once(
 
     executed: list[dict[str, Any]] = []
     warnings: list[str] = []
+    result_dry_run = dry_run or not config.auto_execute
     if not dry_run and config.auto_execute:
         executed = alpaca.submit_orders(preview)
+    elif not dry_run and not config.auto_execute:
+        warnings.append("Execution was requested, but AUTO_EXECUTE is false; preview only.")
     else:
         warnings.append("Dry-run mode is enabled; no trades were submitted.")
 
     return RebalanceResult(
         cik=normalized,
         accession_number=latest.accession_number,
-        dry_run=dry_run,
+        dry_run=result_dry_run,
         preview_path=str(preview_path),
         executed_orders=executed,
         warnings=warnings,
@@ -177,7 +180,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cik", default="0002045724", help="Manager CIK")
     parser.add_argument("--portfolio-size", type=float, default=10_000, help="Target portfolio size")
     parser.add_argument("--once", action="store_true", help="Run one filing check and exit")
-    parser.add_argument("--dry-run", action="store_true", help="Generate previews without trading")
+    parser.add_argument("--dry-run", action="store_true", default=True, help="Generate previews without trading")
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Opt into guarded execution. Requires AUTO_EXECUTE=true and trading safety gates.",
+    )
     parser.add_argument("--schedule", action="store_true", help="Start local APScheduler loop")
     parser.add_argument("--interval-hours", type=int, default=1, help="Scheduler interval")
     return parser
@@ -187,7 +195,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     if args.once:
-        result = run_rebalance_once(args.cik, args.portfolio_size, dry_run=args.dry_run or True)
+        result = run_rebalance_once(args.cik, args.portfolio_size, dry_run=not args.execute)
         print(result)
         return
     if args.schedule:

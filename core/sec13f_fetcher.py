@@ -82,22 +82,33 @@ def normalize_13f_value_to_usd(
     return [value * 1000 for value in numeric_values], "thousands_by_legacy_date"
 
 
-def _resolve_company(identifier: str):
+def _resolve_company(identifier: str, settings: AppConfig):
     from edgar import Company
 
     query = identifier.strip()
     if query.isdigit():
         query = normalize_cik(query)
     else:
-        resolved = _resolve_cik_by_company_name(query)
+        resolved = _resolve_cik_by_company_name(query, settings)
         if resolved:
             query = resolved
     return Company(query)
 
 
-def _resolve_cik_by_company_name(name: str) -> str | None:
+def _identifier_to_cik(identifier: str, settings: AppConfig) -> str:
+    if identifier.strip().isdigit():
+        return normalize_cik(identifier)
+    resolved = _resolve_cik_by_company_name(identifier, settings)
+    if resolved:
+        return resolved
+    raise ValueError("A numeric CIK is required when manager-name lookup fails")
+
+
+def _resolve_cik_by_company_name(name: str, settings: AppConfig) -> str | None:
     try:
-        headers = {"User-Agent": get_settings().edgar_identity or "13F Mirror Trader"}
+        if not settings.edgar_identity:
+            raise ValueError("EDGAR_IDENTITY is required for SEC company-name lookup")
+        headers = {"User-Agent": settings.edgar_identity}
         response = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=20)
         response.raise_for_status()
         needle = name.strip().lower()
@@ -128,7 +139,7 @@ def _latest_13f_from_edgartools(identifier: str, settings: AppConfig) -> tuple[A
         raise ValueError("EDGAR_IDENTITY is required to fetch SEC filings")
     set_identity(settings.edgar_identity)
 
-    company = _resolve_company(identifier)
+    company = _resolve_company(identifier, settings)
     filings = _call_first(company, ["get_filings"], form="13F-HR") or _call_first(
         company, ["get_filings"], form=["13F-HR", "13F-HR/A"]
     )
@@ -177,9 +188,11 @@ def get_latest_filing_metadata(identifier: str, settings: AppConfig | None = Non
         return metadata
     except Exception as exc:
         log_event("edgartools_metadata_failed", cik=identifier, details={"error": str(exc)})
-        cik = normalize_cik(identifier)
+        if not settings.edgar_identity:
+            raise ValueError("EDGAR_IDENTITY is required for SEC submissions fallback") from exc
+        cik = _identifier_to_cik(identifier, settings)
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        headers = {"User-Agent": settings.edgar_identity or "13F Mirror Trader"}
+        headers = {"User-Agent": settings.edgar_identity}
         response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
         payload = response.json()
@@ -229,7 +242,13 @@ def _pick(row: pd.Series, names: list[str]) -> Any:
     return None
 
 
-def clean_holdings(raw: pd.DataFrame, metadata: FilingMetadata) -> pd.DataFrame:
+def clean_holdings(
+    raw: pd.DataFrame,
+    metadata: FilingMetadata,
+    *,
+    total_value_usd: float | None = None,
+    metadata_units: str | None = None,
+) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     raw_values: list[float] = []
     for _, row in raw.iterrows():
@@ -240,7 +259,8 @@ def clean_holdings(raw: pd.DataFrame, metadata: FilingMetadata) -> pd.DataFrame:
         raw_values,
         filing_date=metadata.filing_date,
         report_date=metadata.report_date,
-        total_value_usd=None,
+        total_value_usd=total_value_usd,
+        metadata_units=metadata_units,
     )
     log_event(
         "13f_value_normalized",
@@ -251,7 +271,7 @@ def clean_holdings(raw: pd.DataFrame, metadata: FilingMetadata) -> pd.DataFrame:
 
     for idx, (_, row) in enumerate(raw.iterrows()):
         put_call = _pick(row, ["put_call", "putcall", "put_call_indicator"])
-        ticker = _pick(row, ["ticker", "symbol", "sshprnamt_type"])
+        ticker = _pick(row, ["ticker", "symbol"])
         cusip = _pick(row, ["cusip"])
         shares = _pick(row, ["shares", "sshprnamt", "share_amount", "principal_amount"])
         record = {
@@ -279,15 +299,58 @@ def clean_holdings(raw: pd.DataFrame, metadata: FilingMetadata) -> pd.DataFrame:
     if total <= 0:
         raise ValueError("13F holdings total value is zero after normalization")
     holdings["original_fund_weight"] = holdings["reported_value_usd"] / total
-    holdings["is_trade_eligible"] = holdings["ticker"].notna() & ~holdings["is_option"]
+    holdings["is_trade_eligible"] = [
+        bool(ticker) and not bool(is_option)
+        for ticker, is_option in zip(holdings["ticker"], holdings["is_option"], strict=True)
+    ]
+    holdings["is_trade_eligible"] = holdings["is_trade_eligible"].astype(object)
     return holdings.sort_values("original_fund_weight", ascending=False).reset_index(drop=True)
+
+
+def _extract_total_value_usd(filing: Any, raw: pd.DataFrame | None = None) -> float | None:
+    for obj in [filing, getattr(filing, "summary", None), getattr(filing, "cover_page", None)]:
+        if obj is None:
+            continue
+        for attr in ("total_value_usd", "total_value", "table_value_total", "aggregate_value"):
+            value = getattr(obj, attr, None)
+            if value not in (None, ""):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+    if raw is not None:
+        for column in ("total_value_usd", "total_value"):
+            if column in raw.columns:
+                values = pd.to_numeric(raw[column], errors="coerce").dropna()
+                if not values.empty:
+                    return float(values.iloc[0])
+    return None
+
+
+def _extract_value_units(filing: Any, raw: pd.DataFrame | None = None) -> str | None:
+    for obj in [filing, getattr(filing, "summary", None), getattr(filing, "cover_page", None)]:
+        if obj is None:
+            continue
+        for attr in ("value_units", "units", "value_unit", "table_value_units"):
+            value = getattr(obj, attr, None)
+            if value not in (None, ""):
+                return str(value)
+    if raw is not None:
+        for column in ("value_units", "units", "value_unit"):
+            if column in raw.columns:
+                values = raw[column].dropna()
+                if not values.empty:
+                    return str(values.iloc[0])
+    return None
 
 
 def fetch_latest_13f_holdings(identifier: str, settings: AppConfig | None = None) -> tuple[FilingMetadata, pd.DataFrame]:
     settings = settings or load_config()
     filing, metadata = _latest_13f_from_edgartools(identifier, settings)
     raw = _extract_holdings_from_filing(filing)
-    holdings = clean_holdings(raw, metadata)
+    metadata_units = _extract_value_units(filing, raw)
+    total_value_usd = _extract_total_value_usd(filing, raw)
+    holdings = clean_holdings(raw, metadata, total_value_usd=total_value_usd, metadata_units=metadata_units)
     log_event(
         "13f_holdings_fetched",
         cik=metadata.cik,

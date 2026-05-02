@@ -79,7 +79,7 @@ def generate_trade_preview(
                 {
                     "symbol": symbol,
                     "company": "",
-                    "side": "sell",
+                    "side": "skip",
                     "current_shares": shares,
                     "target_shares": 0.0,
                     "delta_shares": -shares,
